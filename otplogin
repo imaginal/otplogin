@@ -1,0 +1,165 @@
+#!/usr/bin/python
+#
+# Copyright (c) 2020 Volodymyr Flonts <flyonts@gmail.com>
+#
+# License MIT https://opensource.org/licenses/MIT
+#
+from __future__ import print_function
+import os
+import pwd
+import sys
+import time
+import getpass
+import warnings
+import signal
+import syslog
+import pyotp
+
+# getpass may raise warnings
+warnings.formatwarning = lambda msg, *a, **kw: "{}\n".format(msg)
+
+
+def perror(msg, *args, **kwargs):
+    user = getpass.getuser()
+    umsg = "USER={} {}".format(user, msg)
+    syslog.syslog(syslog.LOG_ERR, umsg)
+    kwargs['file'] = sys.stderr
+    print("Error:", msg, *args, **kwargs)
+
+
+def alarm_handler(signum, frame):
+    raise OSError("timeout")
+
+
+def main():
+    keyfile = "~/.google_authenticator"
+
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("usage: otplogin [keyfile [command]]")
+        print("default keyfile", keyfile)
+        print("put before key in .ssh/authorized_keys")
+        print('command="otplogin" ssh-rsa AAA...')
+        return 0
+
+    if "--version" in sys.argv:
+        print("otplogin v0.3 beta")
+        return 0
+
+    syslog.openlog("otplogin", logoption=syslog.LOG_PID,
+                   facility=syslog.LOG_AUTH)
+
+    if len(sys.argv) > 1 and sys.argv[1] != "-":
+        keyfile = sys.argv[1]
+
+    if keyfile.startswith("~/"):
+        homedir = os.environ.get("HOME", ".")
+        keyfile = homedir + keyfile[1:]
+
+    try:
+        kfstat = os.stat(keyfile)
+        kdirst = os.stat(os.path.dirname(keyfile))
+        os.utime(keyfile)
+    except OSError:
+        perror("keyfile not found")
+        return 200
+
+    if time.time() - kfstat.st_mtime < 5:
+        perror("too fast, please wait")
+        return 201
+
+    if kfstat.st_uid != os.getuid():
+        perror("bad keyfile owner")
+        return 202
+
+    if kfstat.st_mode & 0o077 != 0:
+        perror("bad keyfile mode")
+        return 203
+
+    if kdirst.st_mode & 0o022 != 0:
+        perror("bad keydir mode")
+        return 204
+
+    try:
+        with open(keyfile) as fp:
+            secret = fp.readline(100)
+    except OSError:
+        perror("keyfile read error")
+        return 205
+
+    secret = secret.strip()
+
+    if len(secret) < 16:
+        perror("secret too small")
+        return 206
+
+    totp = pyotp.TOTP(secret)
+
+    # for scp: first try get code from environ
+    if "OTP_CODE" in os.environ:
+        code = os.environ.pop("OTP_CODE")
+    else:
+        # setup timeout before password prompt
+        signal.signal(signal.SIGALRM, alarm_handler)
+        signal.alarm(60)
+
+        code = getpass.getpass("OTP code: ")
+        signal.alarm(0)
+
+    code = code.strip()
+
+    if len(code) != 6:
+        perror("code too small")
+        return 207
+
+    if not totp.verify(code, valid_window=8):
+        perror("bad code")
+        return 208
+
+    try:
+        shells = []
+        with open("/etc/shells") as fp:
+            for sh in fp.readlines():
+                sh = sh.strip()
+                if sh and sh[0] != "#":
+                    shells.append(sh)
+    except OSError:
+        perror("/etc/shells not found")
+        return 209
+
+    try:
+        user = pwd.getpwuid(os.getuid())
+        if user.pw_dir:
+            os.chdir(user.pw_dir)
+    except OSError:
+        perror("bad /etc/passwd record")
+        return 210
+
+    if user.pw_shell not in shells:
+        perror("user shell not allowed")
+        return 211
+
+    if len(sys.argv) > 2:
+        args = [user.pw_shell, "-c", " ".join(sys.argv[2:])]
+    else:
+        name = os.path.basename(user.pw_shell)
+        args = ["-" + name]
+
+    umsg = "OTP OK USER={} EXEC {} {}".format(user.pw_name,
+        user.pw_shell, " ".join(args))
+    syslog.syslog(syslog.LOG_NOTICE, umsg)
+
+    os.execl(user.pw_shell, *args)
+
+    perror("exec shell failed")
+    return 212
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        perror("aborted")
+        sys.exit(10)
+    except Exception as exc:
+        perror(str(exc))
+        sys.exit(20)
